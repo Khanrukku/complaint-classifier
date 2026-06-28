@@ -1,4 +1,4 @@
-name: CI — Complaint Classifier
+name: CI - Complaint Classifier
 
 on:
   push:
