@@ -1,10 +1,10 @@
 # AI-Powered Unified Complaint & Analytics Platform
 
-[![CI](https://github.com/Khanrukku/complaint-classifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Khanrukku/complaint-classifier/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.12-blue)
-![Gemini](https://img.shields.io/badge/Gemini-AI-4285F4)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688)
-![License](https://img.shields.io/badge/License-MIT-green)
+[![CI](https://github.com/Khanrukku/complaint-classifier/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/Khanrukku/complaint-classifier/actions/workflows/CI.yml)
+[![Python](https://img.shields.io/badge/Python-3.12-blue)](...)
+[![Gemini](https://img.shields.io/badge/Gemini-AI-4285F4)](...)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.111.0-009688)](...)
+[![License](https://img.shields.io/badge/License-MIT-green)](...)
 
 An **end-to-end NLP pipeline** for automatic complaint classification using **Google Gemini AI**. Classifies customer complaints across 8 categories in under one second, with sentiment analysis, priority scoring, and management dashboards.
 
