@@ -5,7 +5,7 @@ python-dotenv==1.0.1
 
 # LLM
 google-genai==1.27.0
-tenacity==9.0.0
+tenacity==8.5.0
 # Database
 sqlalchemy==2.0.30
 asyncpg==0.29.0
