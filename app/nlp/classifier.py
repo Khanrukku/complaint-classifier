@@ -1,12 +1,14 @@
 """
+app/nlp/classifier.py
+---------------------
 Gemini-powered complaint classification.
 
-The classifier:
-- Sends complaints to Gemini for structured classification.
-- Validates the returned JSON strictly.
-- Retries transient Gemini failures.
-- Limits concurrent batch requests.
-- Returns explicit failures instead of silently hiding them.
+Responsibilities:
+- Send complaints to Gemini for classification.
+- Parse and validate Gemini's JSON response.
+- Enforce application-level classification rules.
+- Retry transient Gemini/API failures.
+- Limit concurrent requests during batch processing.
 """
 
 from __future__ import annotations
@@ -17,49 +19,22 @@ import re
 from typing import Any
 
 from google import genai
-from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
-from app.models.schemas import CATEGORIES, PRIORITIES, SENTIMENTS
+from app.models.schemas import (
+    AIClassification,
+    CATEGORIES,
+    PRIORITIES,
+    SENTIMENTS,
+)
 
 
 # ---------------------------------------------------------------------------
-# Response schema
+# Configuration
 # ---------------------------------------------------------------------------
 
-
-class ClassificationResult(BaseModel):
-    """Validated classification returned by Gemini."""
-
-    category: str
-    subcategory: str = ""
-    sentiment: str
-    priority: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    summary: str
-    suggested_action: str
-
-    def validate_business_rules(self) -> None:
-        """Validate fields against application-level enums."""
-
-        if self.category not in CATEGORIES:
-            raise ValueError(
-                f"Invalid category: {self.category!r}. "
-                f"Expected one of: {CATEGORIES}"
-            )
-
-        if self.sentiment not in SENTIMENTS:
-            raise ValueError(
-                f"Invalid sentiment: {self.sentiment!r}. "
-                f"Expected one of: {SENTIMENTS}"
-            )
-
-        if self.priority not in PRIORITIES:
-            raise ValueError(
-                f"Invalid priority: {self.priority!r}. "
-                f"Expected one of: {PRIORITIES}"
-            )
+MAX_CONCURRENT_REQUESTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +43,7 @@ class ClassificationResult(BaseModel):
 
 
 def _get_client() -> genai.Client:
-    """Create a Gemini client using the configured API key."""
+    """Create and return a Gemini client."""
 
     if not settings.gemini_api_key:
         raise EnvironmentError("GEMINI_API_KEY is not configured.")
@@ -84,42 +59,53 @@ def _get_client() -> genai.Client:
 SYSTEM_PROMPT = f"""
 You are an expert customer-support complaint classifier.
 
-Classify the provided customer complaint and return ONLY a valid JSON object.
+Your task is to classify the provided customer complaint.
 
-Required JSON schema:
+Return ONLY a valid JSON object using exactly this structure:
 
 {{
   "category": "one of {CATEGORIES}",
   "subcategory": "specific label describing the complaint",
   "sentiment": "one of {SENTIMENTS}",
   "priority": "one of {PRIORITIES}",
-  "confidence": "number between 0.0 and 1.0",
-  "summary": "one-sentence summary",
+  "confidence": 0.0,
+  "summary": "one-sentence summary of the complaint",
   "suggested_action": "recommended next action for the support team"
 }}
 
-Priority guidance:
+Classification rules:
 
-- critical:
-  safety issues, legal threats, complete service outages
-- high:
-  significant financial loss, repeated failures, urgent unresolved issues
-- medium:
-  service degradation, delayed resolution, meaningful inconvenience
-- low:
-  general feedback, minor inconvenience, non-urgent requests
+CATEGORY:
+Choose exactly one category from:
+{CATEGORIES}
 
-Confidence should represent the model's estimated certainty in its classification.
-It is NOT a statistically calibrated probability.
+SENTIMENT:
+Choose exactly one:
+{SENTIMENTS}
 
-Return ONLY the JSON object.
-Do not use markdown.
-Do not add explanations.
+PRIORITY:
+- critical: safety issues, legal threats, or complete service outages
+- high: significant financial loss, repeated failures, or urgent unresolved issues
+- medium: service degradation, delays, or meaningful inconvenience
+- low: minor inconvenience, general feedback, or non-urgent requests
+
+CONFIDENCE:
+Return a number between 0.0 and 1.0 representing the model's
+estimated certainty about the classification.
+
+Important:
+The confidence score is a model-estimated score and is NOT a
+statistically calibrated probability.
+
+Do not invent categories.
+Do not return markdown.
+Do not wrap the JSON in code fences.
+Do not add explanations outside the JSON object.
 """.strip()
 
 
 # ---------------------------------------------------------------------------
-# Response parsing
+# JSON parsing
 # ---------------------------------------------------------------------------
 
 
@@ -128,9 +114,9 @@ def _extract_json(raw_text: str) -> dict[str, Any]:
     Extract a JSON object from Gemini's response.
 
     Handles:
-    - normal JSON
-    - markdown JSON fences
-    - JSON surrounded by accidental prose
+    - standard JSON
+    - JSON wrapped in Markdown code fences
+    - JSON surrounded by accidental explanatory text
     """
 
     if not raw_text or not raw_text.strip():
@@ -138,10 +124,21 @@ def _extract_json(raw_text: str) -> dict[str, Any]:
 
     cleaned = raw_text.strip()
 
-    # Remove markdown fences.
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    # Remove Markdown code fences if Gemini accidentally adds them.
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
 
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned,
+    ).strip()
+
+    # First attempt: entire response is valid JSON.
     try:
         parsed = json.loads(cleaned)
 
@@ -153,7 +150,7 @@ def _extract_json(raw_text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: locate the first JSON object.
+    # Second attempt: find a JSON object inside surrounding text.
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
 
     if not match:
@@ -176,29 +173,50 @@ def _extract_json(raw_text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Classification validation
 # ---------------------------------------------------------------------------
 
 
-def _validate_result(
-    result: dict[str, Any],
-) -> ClassificationResult:
+def _validate_result(result: dict[str, Any]) -> AIClassification:
     """
-    Validate Gemini's response.
+    Validate Gemini's classification response.
 
-    Invalid AI output is rejected instead of silently replaced with
-    potentially misleading defaults.
+    Schema validation checks:
+    - required fields
+    - data types
+    - confidence range
+
+    Business-rule validation checks:
+    - category
+    - sentiment
+    - priority
     """
 
     try:
-        classification = ClassificationResult.model_validate(result)
+        classification = AIClassification.model_validate(result)
 
-    except ValidationError as exc:
+    except Exception as exc:
         raise ValueError(
             f"Gemini response failed schema validation: {exc}"
         ) from exc
 
-    classification.validate_business_rules()
+    if classification.category not in CATEGORIES:
+        raise ValueError(
+            f"Invalid category: {classification.category!r}. "
+            f"Expected one of: {CATEGORIES}"
+        )
+
+    if classification.sentiment not in SENTIMENTS:
+        raise ValueError(
+            f"Invalid sentiment: {classification.sentiment!r}. "
+            f"Expected one of: {SENTIMENTS}"
+        )
+
+    if classification.priority not in PRIORITIES:
+        raise ValueError(
+            f"Invalid priority: {classification.priority!r}. "
+            f"Expected one of: {PRIORITIES}"
+        )
 
     return classification
 
@@ -210,17 +228,32 @@ def _validate_result(
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
+    wait=wait_exponential(
+        multiplier=1,
+        min=1,
+        max=8,
+    ),
     reraise=True,
 )
 async def classify_complaint(text: str) -> dict[str, Any]:
     """
     Classify a single complaint using Gemini.
 
+    Retries transient Gemini/API failures up to three times.
+
+    Args:
+        text: Customer complaint text.
+
+    Returns:
+        Validated classification dictionary.
+
     Raises:
-        EnvironmentError: Gemini API key is missing.
-        ValueError: Gemini returns invalid or unusable data.
-        Exception: Gemini/API errors after retries are exhausted.
+        ValueError:
+            If the complaint is empty or Gemini returns invalid data.
+        EnvironmentError:
+            If GEMINI_API_KEY is missing.
+        Exception:
+            If the Gemini request repeatedly fails.
     """
 
     if not text or not text.strip():
@@ -228,7 +261,11 @@ async def classify_complaint(text: str) -> dict[str, Any]:
 
     client = _get_client()
 
-    prompt = f"Complaint:\n{text.strip()}"
+    prompt = f"""
+Complaint:
+
+{text.strip()}
+""".strip()
 
     try:
         response = await asyncio.to_thread(
@@ -238,7 +275,7 @@ async def classify_complaint(text: str) -> dict[str, Any]:
         )
 
     except Exception:
-        # Let Tenacity retry transient provider/API failures.
+        # Allow Tenacity to retry transient provider/API errors.
         raise
 
     raw_text = getattr(response, "text", None)
@@ -246,18 +283,16 @@ async def classify_complaint(text: str) -> dict[str, Any]:
     if not raw_text:
         raise ValueError("Gemini returned no text content.")
 
-    result = _extract_json(raw_text)
-    validated = _validate_result(result)
+    parsed_result = _extract_json(raw_text)
 
-    return validated.model_dump()
+    validated_result = _validate_result(parsed_result)
+
+    return validated_result.model_dump()
 
 
 # ---------------------------------------------------------------------------
 # Batch classification
 # ---------------------------------------------------------------------------
-
-
-MAX_CONCURRENT_REQUESTS = 5
 
 
 async def classify_batch(
@@ -266,8 +301,10 @@ async def classify_batch(
     """
     Classify multiple complaints concurrently.
 
-    Concurrency is limited to avoid sending an uncontrolled number
-    of simultaneous requests to Gemini.
+    A semaphore limits concurrent Gemini requests to prevent an
+    uncontrolled number of simultaneous API calls.
+
+    Results preserve the same order as the input complaints.
     """
 
     if not texts:
@@ -279,12 +316,17 @@ async def classify_batch(
         index: int,
         text: str,
     ) -> tuple[int, dict[str, Any]]:
+
         async with semaphore:
+
             try:
                 result = await classify_complaint(text)
+
                 return index, result
 
             except Exception as exc:
+                # Keep batch processing alive when one complaint fails.
+                # Failed complaints are explicitly marked for manual review.
                 return index, {
                     "category": "other",
                     "subcategory": "",
@@ -297,10 +339,16 @@ async def classify_batch(
                 }
 
     results = await asyncio.gather(
-        *(classify_with_limit(i, text) for i, text in enumerate(texts))
+        *(
+            classify_with_limit(index, text)
+            for index, text in enumerate(texts)
+        )
     )
 
-    # Preserve the original input order.
+    # Restore original input order.
     results.sort(key=lambda item: item[0])
 
-    return [result for _, result in results]
+    return [
+        result
+        for _, result in results
+    ]
